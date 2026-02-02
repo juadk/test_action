@@ -1,0 +1,26 @@
+name: PR Fork Check – Multi Jobs Test
+
+on:
+  pull_request:
+
+jobs:
+  job-a:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "🚀 Job A exécuté (PR interne)"
+
+  job-b:
+    name: Job B (depends on job-a)
+    needs: job-a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "🚀 Job B exécuté (PR interne)"
+
+  job-c:
+    name: Job C (depends on job-a)
+    needs: job-a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "🧪 Job C exécuté (PR interne)"

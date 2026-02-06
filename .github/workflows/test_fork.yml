@@ -1,26 +1,157 @@
-name: PR Fork Check – Multi Jobs Test
+name: Airgap E2E Test
 
 on:
+  workflow_dispatch:
+    inputs:
+      destroy_runner:
+        description: Destroy the auto-generated self-hosted runner
+        default: true
+        type: boolean
+      k3s_version:
+        description: K3S version to use
+        type: string
+        default: 'v1.31.7+k3s1'
+      runner_template:
+        description: Runner template to use
+        default: kubewarden-e2e-ci-runner-x86-64-template-v1
+        type: string
+      zone:
+        description: GCP zone to host the runner
+        default: us-central1-f
+        type: string
   pull_request:
+    branches:
+      - "main"
 
 jobs:
-  job-a:
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "🚀 Job A exécuté (PR interne)"
+  create-runner:
+    # Do not execute the workflow for PRs from forks
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/sub_create-runner.yaml
+    secrets:
+      credentials: ${{ secrets.GCP_CREDENTIALS }}
+      pat_token: ${{ secrets.TEST_SELF_HOSTED_RUNNER_PAT_TOKEN }}
+    with:
+      runner_template: ${{ inputs.runner_template || 'kubewarden-e2e-ci-runner-x86-64-template-v1' }}
+      zone: ${{ inputs.zone || 'us-central1-f' }}
 
-  job-b:
-    name: Job B (depends on job-a)
-    needs: job-a
-    runs-on: ubuntu-latest
+  e2e:
+    needs: create-runner
+    if: ${{ always() && needs.create-runner.result == 'success' }}
+    runs-on: ${{ needs.create-runner.outputs.runner_label }}
+    env:
+      K3S_VERSION: ${{ inputs.k3s_version || 'v1.31.7+k3s1' }}
+      TEST_TYPE: install
     steps:
-      - run: echo "🚀 Job B exécuté (PR interne)"
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-  job-c:
-    name: Job C (depends on job-a)
-    needs: job-a
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "🧪 Job C exécuté (PR interne)"
+      - name: Checkout e2e
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          repository: ${{ github.repository_owner }}/kubewarden-end-to-end-tests
+          path: e2e-tests
+          submodules: 'true'
+
+      - name: Authenticate to GCP
+        id: authenticate
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Download QCOW2 VM image
+        id: download_qcow2
+        run: |
+          QCOW2_FILE="rancher-image.qcow2"
+          gcloud storage cp gs://elemental-airgap-image/${QCOW2_FILE} ${HOME}/${QCOW2_FILE}
+
+      - name: Setup Go
+        id: setup_go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          cache-dependency-path: ./e2e-tests/tests/ginkgo-e2e/go.sum
+          go-version-file: ./e2e-tests/tests/ginkgo-e2e/go.mod
+
+      - name: Define needed system variables
+        run: |
+          # Add missing PATH, removed in recent distributions for security reasons...
+          echo "/usr/local/bin" >> ${GITHUB_PATH}
+
+      - name: Prepare Airgap files
+        run: |
+          cd ${GITHUB_WORKSPACE}/e2e-tests/tests/ginkgo-e2e
+          make e2e-prepare-archive
+
+      - name: Extract component versions/informations
+        id: component
+        run: |
+          HAULER_MANIFEST=./charts/hauler_manifest.yaml
+
+          images=(
+            audit-scanner
+            kubewarden-controller
+            policy-server
+            allow-privilege-escalation-psp
+            capabilities-psp
+            host-namespaces-psp
+            hostpaths-psp
+            pod-privileged
+            user-group-psp
+          )
+          
+          for image in "${images[@]}"; do
+            version=$(grep "${image}:v" "$HAULER_MANIFEST" | cut -d':' -f3)
+            output_var="${image//-/_}"
+          
+            # EXPORT VALUES FOR NEXT STEPS
+            echo "${output_var}=${version}" | tee -a "$GITHUB_OUTPUT"
+          done
+
+      - name: Deploy airgap infrastructure
+        id: deploy_airgap_infra
+        run: cd ${GITHUB_WORKSPACE}/e2e-tests/tests/ginkgo-e2e && make e2e-airgap-rancher
+        env:
+          KUBEWARDEN_CONTROLLER_VERSION: ${{ steps.component.outputs.kubewarden_controller }}
+          AUDIT_SCANNER_VERSION: ${{ steps.component.outputs.audit_scanner }}
+          POLICY_SERVER_VERSION: ${{ steps.component.outputs.policy_server }}
+          ALLOW_PRIVILEGE_ESCALATION_PSP_VERSION: ${{ steps.component.outputs.allow_privilege_escalation_psp }}
+          CAPABILITIES_PSP_VERSION: ${{ steps.component.outputs.capabilities_psp }}
+          HOST_NAMESPACES_PSP_VERSION: ${{ steps.component.outputs.host_namespaces_psp }}
+          HOSTPATHS_PSP_VERSION: ${{ steps.component.outputs.hostpaths_psp }}
+          POD_PRIVILEGED_PSP_VERSION: ${{ steps.component.outputs.pod_privileged }}
+          USER_GROUP_PSP_VERSION: ${{ steps.component.outputs.user_group_psp }}
+      
+      # This step must be called in each worklow that wants a summary!
+      - name: Add summary
+        if: ${{ always() }}
+        env: 
+          STEP_TO_REPORT: airgap_install
+        uses: ./.github/actions/logs-and-summary
+
+      - name: Upload Hauler manifest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: hauler_manifest.yaml
+          path: ${{ github.workspace }}/charts/hauler_manifest.yaml
+          retention-days: 7
+
+  clean-and-delete-runner:
+    needs: [create-runner, e2e]
+    if: ${{ always() && needs.create-runner.result == 'success' && (inputs.destroy_runner == true || github.event_name == 'pull_request') }}
+        #${{ always() && needs.create-runner.result == 'success' && github.event_name == 'pull_request' }}
+    uses: ./.github/workflows/sub_clean-and-delete-runner.yaml
+    secrets:
+      credentials: ${{ secrets.GCP_CREDENTIALS }}
+      pat_token: ${{ secrets.TEST_SELF_HOSTED_RUNNER_PAT_TOKEN }}
+    with:
+      create_runner_result: ${{ needs.create-runner.result }}
+      destroy_runner: ${{ inputs.destroy_runner || true }}
+      runner_hostname: ${{ needs.create-runner.outputs.runner_hostname }}
+      runner_label: ${{ needs.create-runner.outputs.runner_label }}
+      zone: ${{ inputs.zone || 'us-central1-f' }}
